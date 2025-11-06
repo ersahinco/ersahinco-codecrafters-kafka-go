@@ -14,6 +14,7 @@ import (
 )
 
 const (
+	apiKeyProduce            = int16(0)
 	apiKeyFetch              = int16(1)
 	apiKeyApiVersions        = int16(18)
 	apiKeyDescribeTopicParts = int16(75)
@@ -416,7 +417,13 @@ func buildApiVersionsV4Body(corrID int32) []byte {
 	header := appendInt32(nil, corrID)
 	
 	body := appendInt16(nil, errNone)
-	body = appendUVarInt(body, 4) // 3 entries + 1
+	body = appendUVarInt(body, 5) // 4 entries + 1
+	
+	// Produce (0, 0..11)
+	body = appendInt16(body, apiKeyProduce)
+	body = appendInt16(body, 0)
+	body = appendInt16(body, 11)
+	body = appendUVarInt(body, 0)
 	
 	// Fetch (1, 0..16)
 	body = appendInt16(body, apiKeyFetch)
