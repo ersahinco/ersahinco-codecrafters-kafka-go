@@ -463,7 +463,8 @@ type ProduceTopicRequest struct {
 }
 
 type ProducePartitionRequest struct {
-	Index int32
+	Index   int32
+	Records []byte
 }
 
 func handleProduceV11(corrID int32, reqBody []byte, state *BrokerState) []byte {
@@ -503,10 +504,13 @@ func handleProduceV11(corrID int32, reqBody []byte, state *BrokerState) []byte {
 				
 				if partReq.Index >= 0 && partReq.Index < int32(numPartitions) {
 					// Both topic and partition are valid
-					errorCode = errNone
-					baseOffset = 0
-					logAppendTime = -1
-					logStartOffset = 0
+					// Write records to disk
+					if err := writePartitionRecords(topicReq.Name, partReq.Index, partReq.Records); err == nil {
+						errorCode = errNone
+						baseOffset = 0
+						logAppendTime = -1
+						logStartOffset = 0
+					}
 				}
 			}
 			
@@ -558,9 +562,11 @@ func parseProduceRequestV11(reqBody []byte) []ProduceTopicRequest {
 			partReq := ProducePartitionRequest{}
 			partReq.Index = readInt32(&br) // index
 			
-			// Skip records (COMPACT_BYTES)
+			// Read records (COMPACT_BYTES)
 			recordsLen := int(readUVarInt(&br)) - 1
 			if recordsLen > 0 && br.canRead(recordsLen) {
+				partReq.Records = make([]byte, recordsLen)
+				copy(partReq.Records, br.b[br.off:br.off+recordsLen])
 				br.off += recordsLen
 			}
 			
@@ -759,6 +765,23 @@ func readPartitionRecords(topicName string, partition int32) []byte {
 	// Return the raw record batch data
 	// The log file contains the complete RecordBatch which we return as-is
 	return data
+}
+
+func writePartitionRecords(topicName string, partition int32, records []byte) error {
+	// Construct log directory path
+	logDir := fmt.Sprintf("/tmp/kraft-combined-logs/%s-%d", topicName, partition)
+	
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return err
+	}
+	
+	// Construct log file path
+	logPath := fmt.Sprintf("%s/00000000000000000000.log", logDir)
+	
+	// Write the record batch to the log file
+	// We write the records as-is since they're already in RecordBatch format
+	return os.WriteFile(logPath, records, 0644)
 }
 
 func parseFetchRequestV16(reqBody []byte) [][16]byte {
