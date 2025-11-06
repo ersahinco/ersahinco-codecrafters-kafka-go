@@ -329,6 +329,12 @@ func handleConn(conn net.Conn, state *BrokerState) {
 
 		var resp []byte
 		switch apiKey {
+		case apiKeyProduce:
+			if apiVersion != 11 {
+				resp = buildSimpleError(corrID, errUnsupportedVersion)
+			} else {
+				resp = handleProduceV11(corrID, payload, state)
+			}
 		case apiKeyFetch:
 			if apiVersion != 16 {
 				resp = buildSimpleError(corrID, errUnsupportedVersion)
@@ -447,6 +453,111 @@ func buildApiVersionsV4Body(corrID int32) []byte {
 	body = appendUVarInt(body, 0) // TAG_BUFFER
 
 	return frameResponse(header, body)
+}
+
+/* ------------- Produce v11 ------------- */
+
+type ProduceTopicRequest struct {
+	Name       string
+	Partitions []ProducePartitionRequest
+}
+
+type ProducePartitionRequest struct {
+	Index int32
+}
+
+func handleProduceV11(corrID int32, reqBody []byte, state *BrokerState) []byte {
+	// Parse the Produce request to get topic names and partitions
+	topicRequests := parseProduceRequestV11(reqBody)
+	
+	// Response header v1 (flexible): correlation_id + TAG_BUFFER
+	header := appendInt32(nil, corrID)
+	header = appendUVarInt(header, 0) // header TAG_BUFFER
+	
+	// Produce Response v11 body
+	body := appendUVarInt(nil, uint32(len(topicRequests)+1)) // responses array (COMPACT_ARRAY)
+	
+	for _, topicReq := range topicRequests {
+		// TopicProduceResponse
+		body = appendCompactString(body, topicReq.Name) // name
+		
+		// partition_responses array (COMPACT_ARRAY)
+		body = appendUVarInt(body, uint32(len(topicReq.Partitions)+1))
+		
+		for _, partReq := range topicReq.Partitions {
+			// PartitionProduceResponse
+			body = appendInt32(body, partReq.Index)                // index
+			body = appendInt16(body, errUnknownTopicOrPartition)   // error_code = 3
+			body = appendInt64(body, -1)                           // base_offset = -1
+			body = appendInt64(body, -1)                           // log_append_time_ms = -1
+			body = appendInt64(body, -1)                           // log_start_offset = -1
+			body = appendUVarInt(body, 1)                          // record_errors (empty)
+			body = appendCompactString(body, "")                   // error_message (empty)
+			body = appendUVarInt(body, 0)                          // TAG_BUFFER
+		}
+		
+		body = appendUVarInt(body, 0) // TopicProduceResponse TAG_BUFFER
+	}
+	
+	body = appendInt32(body, 0)       // throttle_time_ms = 0
+	body = appendUVarInt(body, 0)     // TAG_BUFFER
+
+	return frameResponse(header, body)
+}
+
+func parseProduceRequestV11(reqBody []byte) []ProduceTopicRequest {
+	br := bytesReader{b: reqBody}
+	
+	// Produce Request v11 fields (in order from Kafka protocol)
+	_, _ = readCompactNullableString(&br) // transactional_id
+	_ = readUVarInt(&br)                  // TAG_BUFFER after transactional_id (flexible version)
+	_ = readInt16(&br)                    // acks
+	_ = readInt32(&br)                    // timeout_ms
+	
+	// topic_data: COMPACT_ARRAY of TopicProduceData
+	nTopics := int(readUVarInt(&br)) - 1
+	if nTopics < 0 {
+		return nil
+	}
+	
+	topicRequests := make([]ProduceTopicRequest, 0, nTopics)
+	for i := 0; i < nTopics; i++ {
+		topicReq := ProduceTopicRequest{}
+		topicReq.Name = readCompactString(&br) // name
+		
+		// partition_data: COMPACT_ARRAY of PartitionProduceData
+		nPartitions := int(readUVarInt(&br)) - 1
+		topicReq.Partitions = make([]ProducePartitionRequest, 0, nPartitions)
+		
+		for j := 0; j < nPartitions; j++ {
+			partReq := ProducePartitionRequest{}
+			partReq.Index = readInt32(&br) // index
+			
+			// Skip records (COMPACT_BYTES)
+			recordsLen := int(readUVarInt(&br)) - 1
+			if recordsLen > 0 && br.canRead(recordsLen) {
+				br.off += recordsLen
+			}
+			
+			_ = readUVarInt(&br) // PartitionProduceData TAG_BUFFER
+			
+			topicReq.Partitions = append(topicReq.Partitions, partReq)
+		}
+		
+		_ = readUVarInt(&br) // TopicProduceData TAG_BUFFER
+		topicRequests = append(topicRequests, topicReq)
+	}
+	
+	return topicRequests
+}
+
+func readInt16(br *bytesReader) int16 {
+	if !br.canRead(2) {
+		return 0
+	}
+	v := int16(binary.BigEndian.Uint16(br.b[br.off : br.off+2]))
+	br.off += 2
+	return v
 }
 
 /* ------------- DescribeTopicPartitions v0 ------------- */
