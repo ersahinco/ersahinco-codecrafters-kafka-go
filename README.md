@@ -1,34 +1,71 @@
-[![progress-banner](https://backend.codecrafters.io/progress/kafka/f74b1247-3077-4cbe-a62f-adb9f2666567)](https://app.codecrafters.io/users/ersahinco?r=2qF)
+# Build Your Own Kafka
 
-This is a starting point for Go solutions to the
-["Build Your Own Kafka" Challenge](https://codecrafters.io/challenges/kafka).
+A clean, pragmatic implementation of a Kafka broker in Go for the [CodeCrafters Kafka Challenge](https://codecrafters.io/challenges/kafka).
 
-In this challenge, you'll build a toy Kafka clone that's capable of accepting
-and responding to ApiVersions & Fetch API requests. You'll also learn about
-encoding and decoding messages using the Kafka wire protocol. You'll also learn
-about handling the network protocol, event loops, TCP sockets and more.
+## Features
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+- ApiVersions request handling (v0-v4)
+- DescribeTopicPartitions request handling (v0)
+- Kafka wire protocol encoding/decoding
+- Flexible message format support (compact types, tagged fields)
+- Concurrent client connections
+- Topic configuration via properties file
 
-# Passing the first stage
-
-The entry point for your Kafka implementation is in `app/main.go`. Study and
-uncomment the relevant code, and push your changes to pass the first stage:
+## Running
 
 ```sh
-git commit -am "pass 1st stage" # any msg
-git push origin master
+./your_program.sh /tmp/server.properties
 ```
 
-That's all!
+Or use the Makefile:
 
-# Stage 2 & beyond
+```sh
+make run
+```
 
-Note: This section is for stages 2 and beyond.
+## Testing
 
-1. Ensure you have `go (1.24)` installed locally
-1. Run `./your_program.sh` to run your Kafka broker, which is implemented in
-   `app/main.go`.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
+```sh
+codecrafters test
+```
+
+## Implementation Notes
+
+### The Tricky Bug: Response Header Versions
+
+The most challenging issue during development was understanding Kafka's response header versions:
+
+**Problem**: DescribeTopicPartitions v0 responses were being rejected by the tester despite sending correct data.
+
+**Root Cause**: Kafka uses different response header versions depending on the API:
+- **Response Header v0**: Just `correlation_id` (4 bytes) - used by older APIs
+- **Response Header v1**: `correlation_id` + `TAG_BUFFER` (4 bytes + 1 byte) - used by flexible APIs
+
+**The Fix**: DescribeTopicPartitions v0 is a flexible API and requires Response Header v1, which includes a TAG_BUFFER byte after the correlation ID. Adding this single byte fixed all tests.
+
+**Additional Gotchas**:
+1. Request headers can have tagged fields that must be skipped (not just a zero byte)
+2. Request bodies may have a TAG_BUFFER before the main fields
+3. Compact arrays encode length as `actual_length + 1`
+4. UUID slicing requires storing the array in a variable first (Go limitation)
+
+### Architecture
+
+The code is structured for clarity and maintainability:
+- `readRequest()` - Handles frame reading and header parsing
+- `parseTopicRequests()` - Extracts topic names from request body
+- `handleDescribeTopicPartitionsV0()` - Builds the response
+- Clean separation between encoding/decoding helpers
+
+## Properties File Format
+
+```properties
+topic.<name>.id=<uuid>
+topic.<name>.partitions=<N>
+```
+
+Example:
+```properties
+topic.alpha.id=11111111-2222-3333-4444-555555555555
+topic.alpha.partitions=2
+```
