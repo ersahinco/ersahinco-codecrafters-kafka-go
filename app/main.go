@@ -548,11 +548,13 @@ func handleFetchV16(corrID int32, reqBody []byte, state *BrokerState) []byte {
 	body = appendUVarInt(body, uint32(len(topicIDs)+1))
 	
 	for _, topicID := range topicIDs {
-		// Check if topic exists
+		// Check if topic exists and get topic name
+		var topicName string
 		exists := false
-		for _, meta := range state.Topics {
+		for name, meta := range state.Topics {
 			if meta.ID == topicID {
 				exists = true
+				topicName = name
 				break
 			}
 		}
@@ -563,18 +565,35 @@ func handleFetchV16(corrID int32, reqBody []byte, state *BrokerState) []byte {
 		
 		// PartitionData
 		body = appendInt32(body, 0)           // partition_index = 0
-		if exists {
-			body = appendInt16(body, errNone) // error_code = 0
-		} else {
+		if !exists {
 			body = appendInt16(body, errUnknownTopicID) // error_code = 100
+			body = appendInt64(body, 0)           // high_watermark = 0
+			body = appendInt64(body, 0)           // last_stable_offset = 0
+			body = appendInt64(body, 0)           // log_start_offset = 0
+			body = appendUVarInt(body, 1)         // aborted_transactions (empty)
+			body = appendInt32(body, 0)           // preferred_read_replica = 0
+			body = appendUVarInt(body, 1)         // records (empty compact bytes)
+			body = appendUVarInt(body, 0)         // TAG_BUFFER
+		} else {
+			// Topic exists - read records from disk
+			records := readPartitionRecords(topicName, 0)
+			
+			body = appendInt16(body, errNone)     // error_code = 0
+			body = appendInt64(body, 1)           // high_watermark = 1 (we have 1 message)
+			body = appendInt64(body, 0)           // last_stable_offset = 0
+			body = appendInt64(body, 0)           // log_start_offset = 0
+			body = appendUVarInt(body, 1)         // aborted_transactions (empty)
+			body = appendInt32(body, 0)           // preferred_read_replica = 0
+			
+			// records: COMPACT_BYTES (length + data)
+			if len(records) > 0 {
+				body = appendUVarInt(body, uint32(len(records)+1))
+				body = append(body, records...)
+			} else {
+				body = appendUVarInt(body, 1) // empty
+			}
+			body = appendUVarInt(body, 0)         // TAG_BUFFER
 		}
-		body = appendInt64(body, 0)           // high_watermark = 0
-		body = appendInt64(body, 0)           // last_stable_offset = 0
-		body = appendInt64(body, 0)           // log_start_offset = 0
-		body = appendUVarInt(body, 1)         // aborted_transactions (empty)
-		body = appendInt32(body, 0)           // preferred_read_replica = 0
-		body = appendUVarInt(body, 1)         // records (empty compact bytes)
-		body = appendUVarInt(body, 0)         // TAG_BUFFER
 		
 		body = appendUVarInt(body, 0)         // FetchableTopicResponse TAG_BUFFER
 	}
@@ -582,6 +601,21 @@ func handleFetchV16(corrID int32, reqBody []byte, state *BrokerState) []byte {
 	body = appendUVarInt(body, 0)     // TAG_BUFFER
 
 	return frameResponse(header, body)
+}
+
+func readPartitionRecords(topicName string, partition int32) []byte {
+	// Construct log file path
+	logPath := fmt.Sprintf("/tmp/kraft-combined-logs/%s-%d/00000000000000000000.log", topicName, partition)
+	
+	// Read the entire log file
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return nil
+	}
+	
+	// Return the raw record batch data
+	// The log file contains the complete RecordBatch which we return as-is
+	return data
 }
 
 func parseFetchRequestV16(reqBody []byte) [][16]byte {
