@@ -19,8 +19,9 @@ const (
 	apiKeyDescribeTopicParts = int16(75)
 
 	errNone                    = int16(0)
-	errUnsupportedVersion      = int16(35) // 0x0023
 	errUnknownTopicOrPartition = int16(3)
+	errUnsupportedVersion      = int16(35)  // 0x0023
+	errUnknownTopicID          = int16(100) // 0x0064
 
 	maxFrameSize = 16 << 20 // 16 MiB safety guard
 )
@@ -531,6 +532,9 @@ func parseTopicRequests(reqBody []byte) []string {
 /* ------------- Fetch v16 ------------- */
 
 func handleFetchV16(corrID int32, reqBody []byte, state *BrokerState) []byte {
+	// Parse the Fetch request to get topic IDs
+	topicIDs := parseFetchRequestV16(reqBody)
+	
 	// Response header v1 (flexible): correlation_id + TAG_BUFFER
 	header := appendInt32(nil, corrID)
 	header = appendUVarInt(header, 0) // header TAG_BUFFER
@@ -539,10 +543,93 @@ func handleFetchV16(corrID int32, reqBody []byte, state *BrokerState) []byte {
 	body := appendInt32(nil, 0)       // throttle_time_ms = 0
 	body = appendInt16(body, errNone) // error_code = 0
 	body = appendInt32(body, 0)       // session_id = 0
-	body = appendUVarInt(body, 1)     // responses array (empty = length 1 for compact array)
+	
+	// responses array (COMPACT_ARRAY)
+	body = appendUVarInt(body, uint32(len(topicIDs)+1))
+	
+	for _, topicID := range topicIDs {
+		// Check if topic exists
+		exists := false
+		for _, meta := range state.Topics {
+			if meta.ID == topicID {
+				exists = true
+				break
+			}
+		}
+		
+		// FetchableTopicResponse
+		body = append(body, topicID[:]...)    // topic_id (UUID)
+		body = appendUVarInt(body, 2)         // partitions array (1 partition)
+		
+		// PartitionData
+		body = appendInt32(body, 0)           // partition_index = 0
+		if exists {
+			body = appendInt16(body, errNone) // error_code = 0
+		} else {
+			body = appendInt16(body, errUnknownTopicID) // error_code = 100
+		}
+		body = appendInt64(body, 0)           // high_watermark = 0
+		body = appendInt64(body, 0)           // last_stable_offset = 0
+		body = appendInt64(body, 0)           // log_start_offset = 0
+		body = appendUVarInt(body, 1)         // aborted_transactions (empty)
+		body = appendInt32(body, 0)           // preferred_read_replica = 0
+		body = appendUVarInt(body, 1)         // records (empty compact bytes)
+		body = appendUVarInt(body, 0)         // TAG_BUFFER
+		
+		body = appendUVarInt(body, 0)         // FetchableTopicResponse TAG_BUFFER
+	}
+	
 	body = appendUVarInt(body, 0)     // TAG_BUFFER
 
 	return frameResponse(header, body)
+}
+
+func parseFetchRequestV16(reqBody []byte) [][16]byte {
+	br := bytesReader{b: reqBody}
+	
+	// Fetch Request v16 fields (in order from Kafka protocol)
+	// cluster_id: COMPACT_NULLABLE_STRING (added in v12)
+	_ = readCompactString(&br) // cluster_id
+	
+	_ = readInt32(&br) // max_wait_ms
+	_ = readInt32(&br) // min_bytes
+	_ = readInt32(&br) // max_bytes
+	_ = readInt8(&br)  // isolation_level
+	_ = readInt32(&br) // session_id
+	_ = readInt32(&br) // session_epoch
+	
+	// topics: COMPACT_ARRAY of FetchTopic
+	nTopics := int(readUVarInt(&br)) - 1
+	if nTopics < 0 {
+		return nil
+	}
+	
+	topicIDs := make([][16]byte, 0, nTopics)
+	for i := 0; i < nTopics; i++ {
+		// Read topic_id (UUID - 16 bytes)
+		if !br.canRead(16) {
+			break
+		}
+		var topicID [16]byte
+		copy(topicID[:], br.b[br.off:br.off+16])
+		br.off += 16
+		topicIDs = append(topicIDs, topicID)
+		
+		// Skip partitions array and TAG_BUFFER
+		nPartitions := int(readUVarInt(&br)) - 1
+		for j := 0; j < nPartitions; j++ {
+			_ = readInt32(&br)   // partition
+			_ = readInt32(&br)   // current_leader_epoch
+			_ = readInt64(&br)   // fetch_offset
+			_ = readInt64(&br)   // last_fetched_epoch
+			_ = readInt64(&br)   // log_start_offset
+			_ = readInt32(&br)   // partition_max_bytes
+			_ = readUVarInt(&br) // TAG_BUFFER
+		}
+		_ = readUVarInt(&br) // FetchTopic TAG_BUFFER
+	}
+	
+	return topicIDs
 }
 
 /* ---------------- Encoding helpers ---------------- */
@@ -565,6 +652,12 @@ func appendInt16(b []byte, v int16) []byte {
 func appendInt32(b []byte, v int32) []byte {
 	var tmp [4]byte
 	binary.BigEndian.PutUint32(tmp[:], uint32(v))
+	return append(b, tmp[:]...)
+}
+
+func appendInt64(b []byte, v int64) []byte {
+	var tmp [8]byte
+	binary.BigEndian.PutUint64(tmp[:], uint64(v))
 	return append(b, tmp[:]...)
 }
 
@@ -615,6 +708,15 @@ func readInt32(br *bytesReader) int32 {
 	}
 	v := int32(binary.BigEndian.Uint32(br.b[br.off : br.off+4]))
 	br.off += 4
+	return v
+}
+
+func readInt64(br *bytesReader) int64 {
+	if !br.canRead(8) {
+		return 0
+	}
+	v := int64(binary.BigEndian.Uint64(br.b[br.off : br.off+8]))
+	br.off += 8
 	return v
 }
 
