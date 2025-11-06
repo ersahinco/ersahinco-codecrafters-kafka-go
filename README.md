@@ -5,11 +5,11 @@ A clean, pragmatic implementation of a Kafka broker in Go for the [CodeCrafters 
 ## Features
 
 - ApiVersions request handling (v0-v4)
-- DescribeTopicPartitions request handling (v0)
+- DescribeTopicPartitions request handling (v0) with cluster metadata parsing
 - Kafka wire protocol encoding/decoding
 - Flexible message format support (compact types, tagged fields)
 - Concurrent client connections
-- Topic configuration via properties file
+- Cluster metadata log parsing for topic discovery
 
 ## Running
 
@@ -47,25 +47,29 @@ The most challenging issue during development was understanding Kafka's response
 1. Request headers can have tagged fields that must be skipped (not just a zero byte)
 2. Request bodies may have a TAG_BUFFER before the main fields
 3. Compact arrays encode length as `actual_length + 1`
-4. UUID slicing requires storing the array in a variable first (Go limitation)
+4. Cluster metadata records use uvarint (unsigned) encoding, not signed varint
+5. Metadata record values start with frame version + record type + TAG_BUFFER
 
 ### Architecture
 
 The code is structured for clarity and maintainability:
+- `loadClusterMetadata()` - Parses Kafka's binary metadata log
+- `parseRecords()` - Extracts TopicRecord and PartitionRecord entries
 - `readRequest()` - Handles frame reading and header parsing
-- `parseTopicRequests()` - Extracts topic names from request body
-- `handleDescribeTopicPartitionsV0()` - Builds the response
+- `handleDescribeTopicPartitionsV0()` - Builds responses with actual topic data
 - Clean separation between encoding/decoding helpers
 
-## Properties File Format
+## Topic Discovery
 
+The broker reads topic metadata from Kafka's cluster metadata log:
+- **Path**: `/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log`
+- **Parsed Records**:
+  - TopicRecord (type 2): topic name and UUID
+  - PartitionRecord (type 3): partition assignments and counts
+- **Encoding**: Binary log format with varint-encoded record batches and uvarint compact strings
+
+Fallback to simple properties file format:
 ```properties
 topic.<name>.id=<uuid>
 topic.<name>.partitions=<N>
-```
-
-Example:
-```properties
-topic.alpha.id=11111111-2222-3333-4444-555555555555
-topic.alpha.partitions=2
 ```

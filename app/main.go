@@ -60,6 +60,13 @@ func main() {
 }
 
 func loadProps(path string, state *BrokerState) error {
+	// First try to load from cluster metadata log
+	logPath := "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log"
+	if err := loadClusterMetadata(logPath, state); err == nil {
+		return nil
+	}
+	
+	// Fallback to simple properties file format
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -108,6 +115,203 @@ func loadProps(path string, state *BrokerState) error {
 		state.Topics[k] = v
 	}
 	return nil
+}
+
+func loadClusterMetadata(logPath string, state *BrokerState) error {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return err
+	}
+
+	
+	// Parse Kafka log file
+	// The log contains record batches with topic metadata
+	// We'll scan for TopicRecord (type 2) and PartitionRecord (type 3) entries
+	
+	// First pass: collect topic records
+	topicRecords := make(map[string]TopicMeta)
+	partitionCounts := make(map[[16]byte]int) // Count partitions by topic UUID
+	
+	offset := 0
+	for offset < len(data)-20 {
+		// Each batch starts with: baseOffset(8) + batchLength(4) + ...
+		if offset+12 > len(data) {
+			break
+		}
+		
+		batchLen := int(binary.BigEndian.Uint32(data[offset+8 : offset+12]))
+		if batchLen <= 0 || batchLen > len(data)-offset-12 {
+			offset++
+			continue
+		}
+		
+		batchEnd := offset + 12 + batchLen
+		if batchEnd > len(data) {
+			break
+		}
+		
+		// Parse records within this batch
+		// Skip batch header (61 bytes total from start)
+		recordsStart := offset + 61
+		if recordsStart >= batchEnd {
+			offset = batchEnd
+			continue
+		}
+		
+		// Parse records
+		parseRecords(data[recordsStart:batchEnd], topicRecords, partitionCounts)
+		offset = batchEnd
+	}
+	
+	// Merge partition counts into topic metadata
+	for name, meta := range topicRecords {
+		if count, ok := partitionCounts[meta.ID]; ok && count > 0 {
+			meta.Partitions = count
+		} else if meta.Partitions == 0 {
+			meta.Partitions = 1 // Default to 1 partition
+		}
+		state.Topics[name] = meta
+	}
+	
+
+	
+	if len(state.Topics) == 0 {
+		return fmt.Errorf("no topics found in cluster metadata")
+	}
+	return nil
+}
+
+func parseRecords(data []byte, topicRecords map[string]TopicMeta, partitionCounts map[[16]byte]int) {
+	br := bytesReader{b: data}
+	
+	for br.off < len(data)-5 {
+		// Record: length(varint) + attributes(int8) + timestampDelta(varint) + offsetDelta(varint) + key + value + headers
+		recLen := int(readVarInt(&br))
+		if recLen <= 0 || br.off+recLen > len(data) {
+			break
+		}
+		
+		recStart := br.off
+		_ = readInt8(&br)          // attributes
+		_ = readVarInt(&br)        // timestampDelta
+		_ = readVarInt(&br)        // offsetDelta
+		keyLen := int(readVarInt(&br))
+		
+		// Skip key if present (or handle null key)
+		if keyLen > 0 && br.canRead(keyLen) {
+			br.off += keyLen
+		}
+		
+		// Read value
+		valueLen := int(readVarInt(&br))
+		
+		if valueLen > 0 && br.canRead(valueLen) {
+			valueData := br.b[br.off : br.off+valueLen]
+			
+			// Parse value to determine record type
+			if len(valueData) >= 2 {
+				recordType := valueData[1]
+				
+				// TopicRecord type = 2
+				if recordType == 2 {
+					parseTopicRecordValue(valueData, topicRecords)
+				} else if recordType == 3 {
+					// PartitionRecord type = 3
+					parsePartitionRecordValue(valueData, partitionCounts)
+				}
+			}
+		}
+		
+		// Skip to next record
+		br.off = recStart + recLen
+	}
+}
+
+func parseTopicRecordValue(data []byte, topicRecords map[string]TopicMeta) {
+	if len(data) < 20 {
+		return
+	}
+	
+	br := bytesReader{b: data}
+	_ = readInt8(&br) // frame version
+	_ = readInt8(&br) // record type (should be 2)
+	_ = readUVarInt(&br) // TAG_BUFFER
+	
+	// Read topic name (compact string using uvarint)
+	nameLen := int(readUVarInt(&br)) - 1
+	if nameLen <= 0 || !br.canRead(nameLen) {
+		return
+	}
+	name := string(br.b[br.off : br.off+nameLen])
+	br.off += nameLen
+	
+	// Read topic ID (UUID - 16 bytes)
+	if !br.canRead(16) {
+		return
+	}
+	var topicID [16]byte
+	copy(topicID[:], br.b[br.off:br.off+16])
+	br.off += 16
+	
+	meta := TopicMeta{
+		ID:         topicID,
+		Partitions: 0, // Will be updated when we parse PartitionRecords
+	}
+	topicRecords[name] = meta
+}
+
+func parsePartitionRecordValue(data []byte, partitionCounts map[[16]byte]int) {
+	if len(data) < 20 {
+		return
+	}
+	
+	br := bytesReader{b: data}
+	_ = readInt8(&br) // frame version
+	_ = readInt8(&br) // record type (should be 3)
+	_ = readUVarInt(&br) // TAG_BUFFER
+	
+	// Read partition_id (int32)
+	if !br.canRead(4) {
+		return
+	}
+	_ = readInt32(&br) // partition_id (we just need to count them)
+	
+	// Read topic_id (UUID - 16 bytes)
+	if !br.canRead(16) {
+		return
+	}
+	var topicID [16]byte
+	copy(topicID[:], br.b[br.off:br.off+16])
+	
+	// Increment partition count for this topic
+	partitionCounts[topicID]++
+}
+
+func readInt8(br *bytesReader) int8 {
+	if !br.canRead(1) {
+		return 0
+	}
+	v := int8(br.b[br.off])
+	br.off++
+	return v
+}
+
+func readVarInt(br *bytesReader) int64 {
+	var x uint64
+	var s uint
+	for i := 0; i < 10; i++ {
+		if !br.canRead(1) {
+			return int64(x >> 1) ^ -(int64(x) & 1)
+		}
+		b := br.b[br.off]
+		br.off++
+		if b < 0x80 {
+			return int64(x|uint64(b)<<s) >> 1 ^ -(int64(x|uint64(b)<<s) & 1)
+		}
+		x |= uint64(b&0x7F) << s
+		s += 7
+	}
+	return 0
 }
 
 func handleConn(conn net.Conn, state *BrokerState) {
@@ -226,7 +430,7 @@ func buildApiVersionsV4Body(corrID int32) []byte {
 
 /* ------------- DescribeTopicPartitions v0 ------------- */
 
-func handleDescribeTopicPartitionsV0(corrID int32, reqBody []byte, _ *BrokerState) []byte {
+func handleDescribeTopicPartitionsV0(corrID int32, reqBody []byte, state *BrokerState) []byte {
 	reqNames := parseTopicRequests(reqBody)
 	sort.Strings(reqNames)
 
@@ -238,17 +442,53 @@ func handleDescribeTopicPartitionsV0(corrID int32, reqBody []byte, _ *BrokerStat
 	body = appendUVarInt(body, uint32(len(reqNames)+1))
 	
 	for _, name := range reqNames {
-		body = appendInt16(body, errUnknownTopicOrPartition)
-		body = appendCompactString(body, name)
-		uuid := nilUUID()
-		body = append(body, uuid[:]...)
-		body = append(body, 0x00)         // is_internal
-		body = appendUVarInt(body, 1)     // empty partitions array
-		body = appendInt32(body, -2147483648)
-		body = appendUVarInt(body, 0)     // TAG_BUFFER
+		meta, exists := state.Topics[name]
+		
+		if !exists {
+			// Topic not found
+			body = appendInt16(body, errUnknownTopicOrPartition)
+			body = appendCompactString(body, name)
+			uuid := nilUUID()
+			body = append(body, uuid[:]...)
+			body = append(body, 0x00)         // is_internal
+			body = appendUVarInt(body, 1)     // empty partitions array
+			body = appendInt32(body, -2147483648)
+			body = appendUVarInt(body, 0)     // TAG_BUFFER
+		} else {
+			// Topic found - return actual data
+			body = appendInt16(body, errNone) // error_code = 0
+			body = appendCompactString(body, name)
+			body = append(body, meta.ID[:]...) // topic_id (UUID)
+			body = append(body, 0x00)          // is_internal = false
+			
+			// partitions array (COMPACT_ARRAY)
+			numPartitions := meta.Partitions
+			if numPartitions == 0 {
+				numPartitions = 1 // Default to 1 partition
+			}
+			body = appendUVarInt(body, uint32(numPartitions+1))
+			
+			for partIdx := 0; partIdx < numPartitions; partIdx++ {
+				body = appendInt16(body, errNone)           // error_code = 0
+				body = appendInt32(body, int32(partIdx))    // partition_index
+				body = appendInt32(body, 1)                 // leader_id (broker 1)
+				body = appendInt32(body, -1)                // leader_epoch
+				body = appendUVarInt(body, 2)               // replica_nodes (1 replica)
+				body = appendInt32(body, 1)                 // replica node 1
+				body = appendUVarInt(body, 2)               // isr_nodes (1 node)
+				body = appendInt32(body, 1)                 // isr node 1
+				body = appendUVarInt(body, 1)               // eligible_leader_replicas (empty)
+				body = appendUVarInt(body, 1)               // last_known_elr (empty)
+				body = appendUVarInt(body, 1)               // offline_replicas (empty)
+				body = appendUVarInt(body, 0)               // TAG_BUFFER
+			}
+			
+			body = appendInt32(body, -2147483648)       // topic_authorized_operations
+			body = appendUVarInt(body, 0)               // TAG_BUFFER
+		}
 	}
 	
-	body = append(body, 0xFF)         // next_cursor: null
+	body = append(body, 0xFF)         // next_cursor: null (-1 as signed byte)
 	body = appendUVarInt(body, 0)     // TAG_BUFFER
 
 	return frameResponse(header, body)
