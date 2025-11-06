@@ -481,16 +481,41 @@ func handleProduceV11(corrID int32, reqBody []byte, state *BrokerState) []byte {
 		// TopicProduceResponse
 		body = appendCompactString(body, topicReq.Name) // name
 		
+		// Check if topic exists
+		topicMeta, topicExists := state.Topics[topicReq.Name]
+		
 		// partition_responses array (COMPACT_ARRAY)
 		body = appendUVarInt(body, uint32(len(topicReq.Partitions)+1))
 		
 		for _, partReq := range topicReq.Partitions {
+			// Validate topic and partition
+			errorCode := errUnknownTopicOrPartition
+			baseOffset := int64(-1)
+			logAppendTime := int64(-1)
+			logStartOffset := int64(-1)
+			
+			if topicExists {
+				// Topic exists, now check if partition exists
+				numPartitions := topicMeta.Partitions
+				if numPartitions == 0 {
+					numPartitions = 1 // Default to 1 partition
+				}
+				
+				if partReq.Index >= 0 && partReq.Index < int32(numPartitions) {
+					// Both topic and partition are valid
+					errorCode = errNone
+					baseOffset = 0
+					logAppendTime = -1
+					logStartOffset = 0
+				}
+			}
+			
 			// PartitionProduceResponse
 			body = appendInt32(body, partReq.Index)                // index
-			body = appendInt16(body, errUnknownTopicOrPartition)   // error_code = 3
-			body = appendInt64(body, -1)                           // base_offset = -1
-			body = appendInt64(body, -1)                           // log_append_time_ms = -1
-			body = appendInt64(body, -1)                           // log_start_offset = -1
+			body = appendInt16(body, errorCode)                    // error_code
+			body = appendInt64(body, baseOffset)                   // base_offset
+			body = appendInt64(body, logAppendTime)                // log_append_time_ms
+			body = appendInt64(body, logStartOffset)               // log_start_offset
 			body = appendUVarInt(body, 1)                          // record_errors (empty)
 			body = appendCompactString(body, "")                   // error_message (empty)
 			body = appendUVarInt(body, 0)                          // TAG_BUFFER
