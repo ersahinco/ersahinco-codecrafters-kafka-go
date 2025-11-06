@@ -158,7 +158,7 @@ func handleConn(conn net.Conn, state *BrokerState) {
 
 		switch apiKey {
 		case apiKeyApiVersions:
-			// Support 0..4; v4 uses flexible response
+			// Support 0..4; v4 uses flexible body
 			supported := apiVersion >= 0 && apiVersion <= 4
 			if !supported {
 				resp := buildApiVersionsErrorOnly(corrID, errUnsupportedVersion)
@@ -190,12 +190,11 @@ func handleConn(conn net.Conn, state *BrokerState) {
 
 /* ---------------- ApiVersions ---------------- */
 
-// error-only (older stage behavior)
+// error-only (older stage behavior) — HEADER V0
 func buildApiVersionsErrorOnly(corrID int32, errorCode int16) []byte {
-	// Response header v1: correlation_id + header TAG_BUFFER (empty)
-	header := make([]byte, 0, 5)
+	// Response header v0: correlation_id only (4 bytes)
+	header := make([]byte, 0, 4)
 	header = appendInt32(header, corrID)
-	header = appendUVarInt(header, 0) // header tags
 
 	// Body: error_code(int16)
 	body := make([]byte, 0, 2)
@@ -204,22 +203,20 @@ func buildApiVersionsErrorOnly(corrID int32, errorCode int16) []byte {
 	return frameResponse(header, body)
 }
 
-// Generic tiny error response: header v1 + body(error_code only)
+// Generic tiny error response: header v0 + body(error_code only)
 func buildSimpleError(corrID int32, errorCode int16) []byte {
-	header := make([]byte, 0, 5)
+	header := make([]byte, 0, 4)
 	header = appendInt32(header, corrID)
-	header = appendUVarInt(header, 0) // header tags
 	body := make([]byte, 0, 2)
 	body = appendInt16(body, errorCode)
 	return frameResponse(header, body)
 }
 
-// Full ApiVersions v4 body with two entries: (18:0..4) and (75:0..0)
+// Full ApiVersions v4 body (flexible) — HEADER V0
 func buildApiVersionsV4Body(corrID int32) []byte {
-	// Response header v1
-	header := make([]byte, 0, 5)
+	// Response header v0
+	header := make([]byte, 0, 4)
 	header = appendInt32(header, corrID)
-	header = appendUVarInt(header, 0) // header tags empty
 
 	body := make([]byte, 0, 64)
 	// error_code = 0
@@ -287,11 +284,9 @@ func handleDescribeTopicPartitionsV0(corrID int32, reqBody []byte, state *Broker
 		_ = readUVarInt(&br)
 	}
 
-	// Build response
-	// Response header v1
-	header := make([]byte, 0, 5)
+	// Response header v0
+	header := make([]byte, 0, 4)
 	header = appendInt32(header, corrID)
-	header = appendUVarInt(header, 0) // header tags
 
 	// Body
 	body := make([]byte, 0, 256)
