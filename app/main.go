@@ -179,11 +179,10 @@ func handleConn(conn net.Conn, state *BrokerState) {
 			_ = writeAll(conn, resp)
 
 		default:
-			// Minimal echo: 8 bytes total: size=0 + correlation_id
-			min := make([]byte, 8)
-			binary.BigEndian.PutUint32(min[0:4], 0)
-			binary.BigEndian.PutUint32(min[4:8], uint32(corrID))
-			_ = writeAll(conn, min)
+			header := make([]byte, 0, 4)
+			header = appendInt32(header, corrID)
+			_ = writeAll(conn, frameResponse(header, nil))
+
 		}
 	}
 }
@@ -248,7 +247,7 @@ func buildApiVersionsV4Body(corrID int32) []byte {
 
 /* ------------- DescribeTopicPartitions v0 ------------- */
 
-func handleDescribeTopicPartitionsV0(corrID int32, reqBody []byte, state *BrokerState) []byte {
+func handleDescribeTopicPartitionsV0(corrID int32, reqBody []byte, _ *BrokerState) []byte {
 	br := bytesReader{b: reqBody}
 
 	// topics: COMPACT_ARRAY of TopicRequest(name: COMPACT_STRING, TAG_BUFFER)
@@ -299,45 +298,17 @@ func handleDescribeTopicPartitionsV0(corrID int32, reqBody []byte, state *Broker
 	// topics: COMPACT_ARRAY
 	body = appendUVarInt(body, uint32(len(reqNames)+1))
 	for _, name := range reqNames {
-		meta, ok := state.Topics[name]
-		if !ok {
-			// unknown topic
-			body = appendInt16(body, errUnknownTopicOrPartition)
-			body = appendCompactString(body, name)
-			tmp := nilUUID()
-			body = append(body, tmp[:]...) // topic_id = nil
-			body = append(body, 0x00)      // is_internal: false
-			// partitions: empty compact array
-			body = appendUVarInt(body, 1)
-			// topic_authorized_operations: INT32 default -2147483648
-			body = appendInt32(body, int32(-2147483648))
-			body = appendUVarInt(body, 0) // topic TAG_BUFFER
-			continue
-		}
-
-		// known topic
-		body = appendInt16(body, errNone)
+		// For this stage: ALWAYS unknown
+		body = appendInt16(body, errUnknownTopicOrPartition)
 		body = appendCompactString(body, name)
-		body = append(body, meta.ID[:]...)
-		body = append(body, 0x00) // is_internal: false
-
-		// partitions: COMPACT_ARRAY with N entries
-		N := meta.Partitions
-		body = appendUVarInt(body, uint32(N+1))
-		for p := 0; p < N; p++ {
-			body = appendInt16(body, errNone)                // error_code
-			body = appendInt32(body, int32(p))               // partition_index
-			body = appendInt32(body, 0)                      // leader_id (dummy)
-			body = appendInt32(body, int32(-1))              // leader_epoch = -1
-			body = appendCompactInt32Array(body, []int32{0}) // replica_nodes
-			body = appendCompactInt32Array(body, []int32{0}) // isr_nodes
-			body = appendUVarInt(body, 1)                    // eligible_leader_replicas: empty
-			body = appendUVarInt(body, 1)                    // last_known_elr: empty
-			body = appendUVarInt(body, 1)                    // offline_replicas: empty
-			body = appendUVarInt(body, 0)                    // partition TAG_BUFFER
-		}
-		body = appendInt32(body, int32(-2147483648)) // topic_authorized_operations
-		body = appendUVarInt(body, 0)                // topic TAG_BUFFER
+		tmp := nilUUID()
+		body = append(body, tmp[:]...) // topic_id = nil
+		body = append(body, 0x00)      // is_internal: false
+		// partitions: empty compact array
+		body = appendUVarInt(body, 1)
+		// topic_authorized_operations: INT32 default -2147483648
+		body = appendInt32(body, int32(-2147483648))
+		body = appendUVarInt(body, 0) // topic TAG_BUFFER
 	}
 
 	// next_cursor: null (single byte FF in flexible)
