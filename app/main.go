@@ -26,11 +26,11 @@ const (
 
 type TopicMeta struct {
 	ID         [16]byte
-	Partitions int // number of partitions (0..N-1)
+	Partitions int
 }
 
 type BrokerState struct {
-	Topics map[string]TopicMeta // topic name -> meta
+	Topics map[string]TopicMeta
 }
 
 func main() {
@@ -64,52 +64,46 @@ func loadProps(path string, state *BrokerState) error {
 	if err != nil {
 		return err
 	}
-	lines := strings.Split(string(b), "\n")
+	
 	tmp := map[string]TopicMeta{}
-	for _, line := range lines {
+	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		if line == "" || strings.HasPrefix(line, "#") || !strings.HasPrefix(line, "topic.") {
 			continue
 		}
-		if !strings.HasPrefix(line, "topic.") {
-			continue
-		}
-		// expected keys:
-		// topic.<name>.id=<uuid>
-		// topic.<name>.partitions=<N>
+		
 		kv := strings.SplitN(line, "=", 2)
 		if len(kv) != 2 {
 			continue
 		}
+		
 		key, val := kv[0], strings.TrimSpace(kv[1])
 		rest := strings.TrimPrefix(key, "topic.")
 		dot := strings.LastIndex(rest, ".")
 		if dot <= 0 || dot == len(rest)-1 {
 			continue
 		}
-		name := rest[:dot]
-		field := rest[dot+1:]
-
+		
+		name, field := rest[:dot], rest[dot+1:]
 		meta := tmp[name]
+		
 		switch field {
 		case "id":
-			id, err := parseUUID(val)
-			if err != nil {
+			if id, err := parseUUID(val); err == nil {
+				meta.ID = id
+			} else {
 				fmt.Println("WARN: invalid uuid for topic", name, ":", err)
-				break
 			}
-			meta.ID = id
 		case "partitions":
-			n, err := strconv.Atoi(val)
-			if err != nil || n < 0 {
+			if n, err := strconv.Atoi(val); err == nil && n >= 0 {
+				meta.Partitions = n
+			} else {
 				fmt.Println("WARN: invalid partitions for topic", name, ":", val)
-				break
 			}
-			meta.Partitions = n
 		}
 		tmp[name] = meta
 	}
-	// commit
+	
 	for k, v := range tmp {
 		state.Topics[k] = v
 	}
@@ -121,126 +115,111 @@ func handleConn(conn net.Conn, state *BrokerState) {
 	r := bufio.NewReader(conn)
 
 	for {
-		// read message_size
-		sizeBuf := make([]byte, 4)
-		if _, err := io.ReadFull(r, sizeBuf); err != nil {
-			return
-		}
-		msgSize := int32(binary.BigEndian.Uint32(sizeBuf))
-		if msgSize <= 0 || msgSize > maxFrameSize {
+		payload, corrID, apiKey, apiVersion, err := readRequest(r)
+		if err != nil {
 			return
 		}
 
-		// read payload
-		payload := make([]byte, msgSize)
-		if _, err := io.ReadFull(r, payload); err != nil {
-			return
-		}
-
-		// parse request header v2: first 8 bytes are fixed
-		if len(payload) < 8 {
-			return
-		}
-		apiKey := int16(binary.BigEndian.Uint16(payload[0:2]))
-		apiVersion := int16(binary.BigEndian.Uint16(payload[2:4]))
-		corrID := int32(binary.BigEndian.Uint32(payload[4:8]))
-
-		// header v2 continues with: client_id (COMPACT_NULLABLE_STRING), header TAG_BUFFER (UVarInt)
-		hbr := bytesReader{b: payload, off: 8}
-		_, _ = readCompactNullableString(&hbr) // client_id (ignored; just advance)
-		_ = readUVarInt(&hbr)                  // header TAG_BUFFER
-
-		// the request body starts here (flexible)
-		if hbr.off > len(payload) {
-			return
-		}
-		body := payload[hbr.off:]
-
+		var resp []byte
 		switch apiKey {
 		case apiKeyApiVersions:
-			// Support 0..4; v4 uses flexible body
-			supported := apiVersion >= 0 && apiVersion <= 4
-			if !supported {
-				resp := buildApiVersionsErrorOnly(corrID, errUnsupportedVersion)
-				_ = writeAll(conn, resp)
-				continue
+			if apiVersion < 0 || apiVersion > 4 {
+				resp = buildApiVersionsErrorOnly(corrID, errUnsupportedVersion)
+			} else {
+				resp = buildApiVersionsV4Body(corrID)
 			}
-			resp := buildApiVersionsV4Body(corrID)
-			_ = writeAll(conn, resp)
-
 		case apiKeyDescribeTopicParts:
-			// Only version 0 for these stages
 			if apiVersion != 0 {
-				resp := buildSimpleError(corrID, errUnsupportedVersion)
-				_ = writeAll(conn, resp)
-				continue
+				resp = buildSimpleError(corrID, errUnsupportedVersion)
+			} else {
+				resp = handleDescribeTopicPartitionsV0(corrID, payload, state)
 			}
-			resp := handleDescribeTopicPartitionsV0(corrID, body, state)
-			_ = writeAll(conn, resp)
-
 		default:
-			header := make([]byte, 0, 4)
-			header = appendInt32(header, corrID)
-			_ = writeAll(conn, frameResponse(header, nil))
-
+			resp = frameResponse(appendInt32(nil, corrID), nil)
+		}
+		
+		if writeAll(conn, resp) != nil {
+			return
 		}
 	}
 }
 
+func readRequest(r *bufio.Reader) (body []byte, corrID int32, apiKey, apiVersion int16, err error) {
+	var sizeBuf [4]byte
+	if _, err = io.ReadFull(r, sizeBuf[:]); err != nil {
+		return
+	}
+	
+	msgSize := int32(binary.BigEndian.Uint32(sizeBuf[:]))
+	if msgSize <= 0 || msgSize > maxFrameSize {
+		err = fmt.Errorf("invalid message size")
+		return
+	}
+
+	payload := make([]byte, msgSize)
+	if _, err = io.ReadFull(r, payload); err != nil {
+		return
+	}
+
+	if len(payload) < 8 {
+		err = fmt.Errorf("payload too short")
+		return
+	}
+	
+	apiKey = int16(binary.BigEndian.Uint16(payload[0:2]))
+	apiVersion = int16(binary.BigEndian.Uint16(payload[2:4]))
+	corrID = int32(binary.BigEndian.Uint32(payload[4:8]))
+
+	hbr := bytesReader{b: payload, off: 8}
+	_, _ = readCompactNullableString(&hbr) // client_id
+	
+	// Read and skip TAG_BUFFER
+	tagBufLen := readUVarInt(&hbr)
+	if tagBufLen > 0 && hbr.canRead(int(tagBufLen)) {
+		hbr.off += int(tagBufLen) // Skip tagged fields
+	}
+
+	if hbr.off > len(payload) {
+		err = fmt.Errorf("invalid header")
+		return
+	}
+	
+	body = payload[hbr.off:]
+	return
+}
+
 /* ---------------- ApiVersions ---------------- */
 
-// error-only (older stage behavior) — HEADER V0
 func buildApiVersionsErrorOnly(corrID int32, errorCode int16) []byte {
-	// Response header v0: correlation_id only (4 bytes)
-	header := make([]byte, 0, 4)
-	header = appendInt32(header, corrID)
-
-	// Body: error_code(int16)
-	body := make([]byte, 0, 2)
-	body = appendInt16(body, errorCode)
-
-	return frameResponse(header, body)
+	return buildSimpleError(corrID, errorCode)
 }
 
-// Generic tiny error response: header v0 + body(error_code only)
 func buildSimpleError(corrID int32, errorCode int16) []byte {
-	header := make([]byte, 0, 4)
-	header = appendInt32(header, corrID)
-	body := make([]byte, 0, 2)
-	body = appendInt16(body, errorCode)
+	header := appendInt32(nil, corrID)
+	body := appendInt16(nil, errorCode)
 	return frameResponse(header, body)
 }
 
-// Full ApiVersions v4 body (flexible) — HEADER V0
 func buildApiVersionsV4Body(corrID int32) []byte {
-	// Response header v0
-	header := make([]byte, 0, 4)
-	header = appendInt32(header, corrID)
-
-	body := make([]byte, 0, 64)
-	// error_code = 0
-	body = appendInt16(body, errNone)
-
-	// api_keys: compact array with 2 entries → length = count+1 = 3
-	body = appendUVarInt(body, 3)
-
-	// entry #1: ApiVersions (18, 0..4) + entry TAG_BUFFER=0
+	header := appendInt32(nil, corrID)
+	
+	body := appendInt16(nil, errNone)
+	body = appendUVarInt(body, 3) // 2 entries + 1
+	
+	// ApiVersions (18, 0..4)
 	body = appendInt16(body, apiKeyApiVersions)
 	body = appendInt16(body, 0)
 	body = appendInt16(body, 4)
 	body = appendUVarInt(body, 0)
-
-	// entry #2: DescribeTopicPartitions (75, 0..0) + entry TAG_BUFFER=0
+	
+	// DescribeTopicPartitions (75, 0..0)
 	body = appendInt16(body, apiKeyDescribeTopicParts)
 	body = appendInt16(body, 0)
 	body = appendInt16(body, 0)
 	body = appendUVarInt(body, 0)
-
-	// throttle_time_ms = 0
-	body = appendInt32(body, 0)
-
-	// response TAG_BUFFER=0
-	body = appendUVarInt(body, 0)
+	
+	body = appendInt32(body, 0)  // throttle_time_ms
+	body = appendUVarInt(body, 0) // TAG_BUFFER
 
 	return frameResponse(header, body)
 }
@@ -248,76 +227,52 @@ func buildApiVersionsV4Body(corrID int32) []byte {
 /* ------------- DescribeTopicPartitions v0 ------------- */
 
 func handleDescribeTopicPartitionsV0(corrID int32, reqBody []byte, _ *BrokerState) []byte {
-	br := bytesReader{b: reqBody}
-
-	// topics: COMPACT_ARRAY of TopicRequest(name: COMPACT_STRING, TAG_BUFFER)
-	nTopics := int(readUVarInt(&br)) - 1
-	if nTopics < 0 {
-		nTopics = 0
-	}
-	reqNames := make([]string, 0, nTopics)
-	for i := 0; i < nTopics; i++ {
-		name := readCompactString(&br)
-		_ = readUVarInt(&br) // TopicRequest TAG_BUFFER (ignored)
-		reqNames = append(reqNames, name)
-	}
-
-	// response_partition_limit
-	_ = readInt32(&br)
-
-	// cursor: OPTION<Cursor> (nullable struct).
-	if br.canRead(1) {
-		marker := br.b[br.off]
-		if marker == 0xFF {
-			br.off++
-		} else {
-			// Cursor struct: topic_name (compact string), partition_index (int32), TAG_BUFFER
-			_ = readCompactString(&br)
-			_ = readInt32(&br)
-			_ = readUVarInt(&br) // cursor TAG_BUFFER
-		}
-	}
-
-	// trailing request TAG_BUFFER
-	if br.remaining() > 0 {
-		_ = readUVarInt(&br)
-	}
-
-	// Response header v0
-	header := make([]byte, 0, 4)
-	header = appendInt32(header, corrID)
-
-	// Body
-	body := make([]byte, 0, 256)
-	// throttle_time_ms
-	body = appendInt32(body, 0)
-
-	// topics must be sorted alphabetically by name
+	reqNames := parseTopicRequests(reqBody)
 	sort.Strings(reqNames)
 
-	// topics: COMPACT_ARRAY
+	// Response header v1 (flexible): correlation_id + TAG_BUFFER
+	header := appendInt32(nil, corrID)
+	header = appendUVarInt(header, 0) // header TAG_BUFFER
+	
+	body := appendInt32(nil, 0) // throttle_time_ms
 	body = appendUVarInt(body, uint32(len(reqNames)+1))
+	
 	for _, name := range reqNames {
-		// For this stage: ALWAYS unknown
 		body = appendInt16(body, errUnknownTopicOrPartition)
 		body = appendCompactString(body, name)
-		tmp := nilUUID()
-		body = append(body, tmp[:]...) // topic_id = nil
-		body = append(body, 0x00)      // is_internal: false
-		// partitions: empty compact array
-		body = appendUVarInt(body, 1)
-		// topic_authorized_operations: INT32 default -2147483648
-		body = appendInt32(body, int32(-2147483648))
-		body = appendUVarInt(body, 0) // topic TAG_BUFFER
+		uuid := nilUUID()
+		body = append(body, uuid[:]...)
+		body = append(body, 0x00)         // is_internal
+		body = appendUVarInt(body, 1)     // empty partitions array
+		body = appendInt32(body, -2147483648)
+		body = appendUVarInt(body, 0)     // TAG_BUFFER
 	}
-
-	// next_cursor: null (single byte FF in flexible)
-	body = append(body, 0xFF)
-
-	// response TAG_BUFFER
-	body = appendUVarInt(body, 0)
+	
+	body = append(body, 0xFF)         // next_cursor: null
+	body = appendUVarInt(body, 0)     // TAG_BUFFER
 
 	return frameResponse(header, body)
+}
+
+func parseTopicRequests(reqBody []byte) []string {
+	br := bytesReader{b: reqBody}
+	
+	// Skip request-level TAG_BUFFER
+	_ = readUVarInt(&br)
+	
+	// topics: COMPACT_ARRAY of TopicRequest
+	nTopics := int(readUVarInt(&br)) - 1
+	if nTopics < 0 {
+		return nil
+	}
+	
+	names := make([]string, 0, nTopics)
+	for i := 0; i < nTopics; i++ {
+		name := readCompactString(&br)
+		_ = readUVarInt(&br) // TopicRequest TAG_BUFFER
+		names = append(names, name)
+	}
+	return names
 }
 
 /* ---------------- Encoding helpers ---------------- */
@@ -359,14 +314,6 @@ func appendCompactString(b []byte, s string) []byte {
 	return append(b, []byte(s)...)
 }
 
-func appendCompactInt32Array(b []byte, xs []int32) []byte {
-	b = appendUVarInt(b, uint32(len(xs)+1))
-	for _, v := range xs {
-		b = appendInt32(b, v)
-	}
-	return b
-}
-
 func nilUUID() [16]byte {
 	return [16]byte{}
 }
@@ -375,17 +322,15 @@ func parseUUID(in string) ([16]byte, error) {
 	var out [16]byte
 	s := strings.ReplaceAll(strings.TrimSpace(in), "-", "")
 	if len(s) != 32 {
-		return out, fmt.Errorf("uuid must be 32 hex chars (no dashes), got %d", len(s))
+		return out, fmt.Errorf("uuid must be 32 hex chars, got %d", len(s))
 	}
 	b, err := hex.DecodeString(s)
 	if err != nil {
 		return out, err
 	}
-	copy(out[:], b[:16])
+	copy(out[:], b)
 	return out, nil
 }
-
-/* ---------------- Decoding helpers (request) ---------------- */
 
 type bytesReader struct {
 	b   []byte
@@ -393,7 +338,6 @@ type bytesReader struct {
 }
 
 func (br *bytesReader) canRead(n int) bool { return br.off+n <= len(br.b) }
-func (br *bytesReader) remaining() int     { return len(br.b) - br.off }
 
 func readInt32(br *bytesReader) int32 {
 	if !br.canRead(4) {
@@ -453,15 +397,7 @@ func readCompactNullableString(br *bytesReader) (string, bool) {
 	return s, false
 }
 
-/* ---------------- IO ---------------- */
-
 func writeAll(w io.Writer, data []byte) error {
-	for off := 0; off < len(data); {
-		n, err := w.Write(data[off:])
-		if err != nil {
-			return err
-		}
-		off += n
-	}
-	return nil
+	_, err := w.Write(data)
+	return err
 }
