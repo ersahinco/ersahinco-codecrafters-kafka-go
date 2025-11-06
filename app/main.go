@@ -327,6 +327,12 @@ func handleConn(conn net.Conn, state *BrokerState) {
 
 		var resp []byte
 		switch apiKey {
+		case apiKeyFetch:
+			if apiVersion != 16 {
+				resp = buildSimpleError(corrID, errUnsupportedVersion)
+			} else {
+				resp = handleFetchV16(corrID, payload, state)
+			}
 		case apiKeyApiVersions:
 			if apiVersion < 0 || apiVersion > 4 {
 				resp = buildApiVersionsErrorOnly(corrID, errUnsupportedVersion)
@@ -520,6 +526,23 @@ func parseTopicRequests(reqBody []byte) []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+/* ------------- Fetch v16 ------------- */
+
+func handleFetchV16(corrID int32, reqBody []byte, state *BrokerState) []byte {
+	// Response header v1 (flexible): correlation_id + TAG_BUFFER
+	header := appendInt32(nil, corrID)
+	header = appendUVarInt(header, 0) // header TAG_BUFFER
+	
+	// Fetch Response v16 body
+	body := appendInt32(nil, 0)       // throttle_time_ms = 0
+	body = appendInt16(body, errNone) // error_code = 0
+	body = appendInt32(body, 0)       // session_id = 0
+	body = appendUVarInt(body, 1)     // responses array (empty = length 1 for compact array)
+	body = appendUVarInt(body, 0)     // TAG_BUFFER
+
+	return frameResponse(header, body)
 }
 
 /* ---------------- Encoding helpers ---------------- */
